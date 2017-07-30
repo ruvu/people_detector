@@ -5,6 +5,7 @@ import math
 import PyKDL as kdl
 from collections import namedtuple
 from itertools import groupby
+import cv2 as cv
 
 import image_geometry
 import message_filters
@@ -48,7 +49,7 @@ class Skeleton(object):
     {L,R}{Shoulder,Elbow,Wrist,Hip,Knee,Ankle,Eye,Ear}
     """
 
-    def __init__(self, bodyparts):
+    def __init__(self, group_id, bodyparts):
         """Constructor
 
         :param bodyparts: {name: Joint}
@@ -79,6 +80,7 @@ class Skeleton(object):
         ]
 
         self.bodyparts = bodyparts
+        self.group_id = group_id
 
     def filter_bodyparts(self, threshold):
         filter_list = set()
@@ -92,7 +94,7 @@ class Skeleton(object):
                     filter_list.add(a)
                     filter_list.add(b)
 
-        return Skeleton({name: joint for name, joint in self.bodyparts.items() if name not in filter_list})
+        return Skeleton(self.group_id, {name: joint for name, joint in self.bodyparts.items() if name not in filter_list})
 
     # def __iter__(self):
     #     return self.bodyparts.__iter__()
@@ -115,7 +117,7 @@ class Skeleton(object):
         :returns [Point], with point pairs for all the links
         """
         for (a, b) in self.links:
-            if a in self.bodyparts and b in self.bodyparts:
+            if a in self.bodyparts and b in self.bodyparts and a != "Nose" and b != "Nose":
                 # rospy.loginfo("Add link {}".format((a, b)))
                 yield self.bodyparts[a].point
                 yield self.bodyparts[b].point
@@ -155,6 +157,7 @@ def get_param(name, default):
         rospy.logwarn('parameter %s not set, using the default value of %s', name, default)
         return rospy.get_param(name, default)
 
+CMAP = None
 
 class PeopleDetector(object):
     padding = 5
@@ -181,6 +184,8 @@ class PeopleDetector(object):
         self.person_pub = rospy.Publisher('persons', People, queue_size=1)
         self.markers_pub = rospy.Publisher('~viz', MarkerArray, queue_size=1)
         self.regions_viz_pub = rospy.Publisher('~regions_viz', Image, queue_size=1)
+        self.head_depth_pub = rospy.Publisher('~head_depth', Image, queue_size=1)
+        self.head_rgb_pub = rospy.Publisher('~scaled_rgb', Image, queue_size=1)
 
         # before subscribing, wait for services
         rospy.loginfo('wait for service [%s]', self.recognize.resolved_name)
@@ -208,22 +213,28 @@ class PeopleDetector(object):
             return
         rospy.loginfo('openpose took %f seconds', (rospy.Time.now() - t).to_sec())
 
-        joints = self.recognitions_to_joints(data.recognitions, rgb, depth, cam_model)
+        joints, cmap = self.recognitions_to_joints(data.recognitions, rgb, depth, cam_model)
 
         # groupby group_id
-        groups = []
+        groups = {}
         for group_id, js in groupby(joints, lambda j: j.group_id):
-            groups.append(list(js))
+            groups[group_id] = list(js)
 
         markers = MarkerArray()
         markers.markers.append(Marker(action=Marker.DELETEALL))
 
-        # visualize joints
-        cmap = color_map(N=len(groups), normalized=True)
-        for i, js in enumerate(groups):
-            rospy.loginfo('found %s objects for group %s', len(js), i)
+        if len(groups) == 0:
+            return
 
-            points = [j.point for j in js]
+        # visualize joints
+        # cmap = color_map(N=max(groups.keys()) + 2, normalized=True)
+        i = 0
+        for group_id, js in groups.items():
+            i += 1
+            rospy.loginfo('found %s objects for group %s', len(js), group_id)
+
+            points = [j.point for j in js if j.name != "Nose"]
+            color_idx = group_id + 1
             markers.markers.append(Marker(header=rgb.header,
                                           ns='joints',
                                           id=i,
@@ -231,13 +242,15 @@ class PeopleDetector(object):
                                           action=Marker.ADD,
                                           points=points,
                                           scale=Vector3(0.07, 0.07, 0.07),
-                                          color=ColorRGBA(cmap[i, 0], cmap[i, 1], cmap[i, 2], 1.0)))
+                                          color=ColorRGBA(cmap[color_idx, 0], cmap[color_idx, 1], cmap[color_idx, 2], 1.0)))
 
-        skeletons = [Skeleton({j.name: j for j in js}) for js in groups]
+        skeletons = [Skeleton(group_id, {j.name: j for j in js}) for group_id, js in groups.items()]
         skeletons = [s.filter_bodyparts(self.link_threshold) for s in skeletons]
 
         # visualize links
-        for i, s in enumerate(skeletons):
+        for s in skeletons:
+            i += 1  
+            color_idx = s.group_id + 1
             markers.markers.append(Marker(header=rgb.header,
                                           ns='links',
                                           id=i,
@@ -245,10 +258,10 @@ class PeopleDetector(object):
                                           action=Marker.ADD,
                                           points=list(s.get_links()),
                                           scale=Vector3(0.03, 0, 0),
-                                          color=ColorRGBA(cmap[i, 0] * 0.9, cmap[i, 1] * 0.9, cmap[i, 2] * 0.9, 1.0)))
+                                          color=ColorRGBA(cmap[color_idx, 0] * 0.9, cmap[color_idx, 1] * 0.9, cmap[color_idx, 2] * 0.9, 1.0)))
 
         # create persons
-        persons = []
+        persons = {}
         for s in skeletons:
             if 'Neck' not in s:
                 continue
@@ -264,19 +277,22 @@ class PeopleDetector(object):
                 person.tags.append("is_pointing")
                 person.pointing_pose = pointing_pose
 
-            persons.append(person)
+            persons[s.group_id] = person
 
         # visualize persons
         height = 1.8
         head = 0.2
 
         q = tf.transformations.quaternion_from_euler(-math.pi / 2, 0, 0)
-        for i, p in enumerate(persons):
+        i = 0
+        for group_id, p in persons.items():
+            i+=1
             text = ','.join(p.tags)
             y_max = p.position.y - 2 * head
             y_avg = p.position.y - head + height / 2
             p_avg = Point(p.position.x, y_avg, p.position.z)
             p_head = Point(p.position.x, y_max, p.position.z)
+            color_idx = group_id + 1
             # markers.markers.append(Marker(header=rgb.header,
             #                               ns='persons',
             #                               id=i,
@@ -293,7 +309,7 @@ class PeopleDetector(object):
                                               action=Marker.ADD,
                                               pose=p.pointing_pose,
                                               scale=Vector3(0.5, 0.05, 0.05),
-                                              color=ColorRGBA(cmap[i, 0], cmap[i, 1], cmap[i, 2], 1.0)))
+                                              color=ColorRGBA(cmap[color_idx, 0], cmap[color_idx, 1], cmap[color_idx, 2], 1.0)))
 
             # markers.markers.append(Marker(header=rgb.header,
             #                               ns='labels',
@@ -313,6 +329,13 @@ class PeopleDetector(object):
     def recognitions_to_joints(self, recognitions, rgb, depth, cam_model):
         cv_depth = self.bridge.imgmsg_to_cv2(depth)
         regions_viz = np.zeros_like(cv_depth)
+        head_viz = np.zeros_like(cv_depth)
+
+        cv_rgb = self.bridge.imgmsg_to_cv2(rgb)
+        resized_cv_rgb = cv.resize(cv_rgb, (depth.width, depth.height))
+
+        ngroups = len(set(r.group_id for r in recognitions))
+        cmap = color_map(N=ngroups+2, normalized=True)
 
         joints = []
         for r in recognitions:
@@ -320,6 +343,9 @@ class PeopleDetector(object):
             pl = r.categorical_distribution.probabilities[0]
             label = pl.label
             p = pl.probability
+
+            if label in ["LEye", "REye", "LEar", "REar"]:
+                continue
 
             if p < self.threshold:
                 continue
@@ -347,7 +373,6 @@ class PeopleDetector(object):
 
             # debugging viz
             regions_viz[y_min:y_max, x_min:x_max] = cv_depth[y_min:y_max, x_min:x_max]
-            self.regions_viz_pub.publish(self.bridge.cv2_to_imgmsg(regions_viz))
 
             u = (x_min + x_max) // 2
             v = (y_min + y_max) // 2
@@ -373,6 +398,34 @@ class PeopleDetector(object):
             point = Point(*point3d)
             joints.append(Joint(r.group_id, label, p, point))
 
+            # Head viz
+            if label == "Nose":
+                x_head_padding = int(50 / d)
+                y_head_padding = int(100 / d)
+
+                x_min = max(0, x_min - x_head_padding)
+                x_max = min(depth.width - 1, x_max + x_head_padding)
+                y_min = max(0, y_min - y_head_padding)
+                y_max = min(depth.height -1, y_max + y_head_padding)
+
+                head_viz[y_min:y_max, x_min:x_max] = d
+                cv.rectangle(resized_cv_rgb, (x_min, y_min), (x_max, y_max), (cmap[r.group_id+1, 2] * 255,
+                                                                              cmap[r.group_id+1, 1] * 255,
+                                                                              cmap[r.group_id+1, 0] * 255), 10)
+
+        regions_depth_msg = self.bridge.cv2_to_imgmsg(regions_viz)
+        regions_depth_msg.header = depth.header
+
+        head_depth_msg = self.bridge.cv2_to_imgmsg(head_viz)
+        head_depth_msg.header = depth.header
+
+        scaled_rgb_msg = self.bridge.cv2_to_imgmsg(resized_cv_rgb)
+        scaled_rgb_msg.header = depth.header
+
+        self.regions_viz_pub.publish(regions_depth_msg)
+        self.head_depth_pub.publish(head_depth_msg)
+        self.head_rgb_pub.publish(scaled_rgb_msg)
+
         new_joints = []
         for joint in joints:
             if joint.point.z:
@@ -393,7 +446,7 @@ class PeopleDetector(object):
                 else:
                     new_joints.append(joint)
 
-        return new_joints
+        return new_joints, cmap
 
     def get_person_tags(self, skeleton):
         tags = []
