@@ -184,8 +184,8 @@ class PeopleDetector(object):
         self.person_pub = rospy.Publisher('persons', People, queue_size=1)
         self.markers_pub = rospy.Publisher('~viz', MarkerArray, queue_size=1)
         self.regions_viz_pub = rospy.Publisher('~regions_viz', Image, queue_size=1)
-        self.head_depth_pub = rospy.Publisher('~head_depth', Image, queue_size=1)
-        self.head_rgb_pub = rospy.Publisher('~scaled_rgb', Image, queue_size=1)
+        self.head_depth_pub = rospy.Publisher('top_kinect/head_depth', Image, queue_size=1)
+        self.head_rgb_pub = rospy.Publisher('top_kinect/scaled_rgb', Image, queue_size=1)
 
         # before subscribing, wait for services
         rospy.loginfo('wait for service [%s]', self.recognize.resolved_name)
