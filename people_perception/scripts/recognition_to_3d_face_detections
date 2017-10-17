@@ -1,0 +1,111 @@
+#!/usr/bin/env python
+from __future__ import division
+
+import image_geometry
+import message_filters
+import numpy as np
+import rospy
+from cv_bridge import CvBridge
+from std_msgs.msg import ColorRGBA
+from geometry_msgs.msg import Point, Vector3
+from image_recognition_msgs.msg import Recognitions
+from people_perception_msgs.msg import FaceDetection, FaceDetections
+from sensor_msgs.msg import Image, CameraInfo
+from visualization_msgs.msg import Marker
+
+
+def get_param(name, default):
+    if rospy.has_param(name):
+        return rospy.get_param(name)
+    else:
+        rospy.logwarn('parameter %s not set, using the default value of %s', name, default)
+        return rospy.get_param(name, default)
+
+
+class RecognitionTo3DFaceDetections(object):
+    padding = 5
+
+    def __init__(self):
+        self.bridge = CvBridge()
+
+        # parameters
+        self.threshold = float(get_param('~probability_threshold', 0.2))
+
+        # camera topics
+        depth_info_sub = message_filters.Subscriber('camera/depth/camera_info', CameraInfo)
+        depth_sub = message_filters.Subscriber('camera/depth/image_rect', Image)
+        recognitions_sub = message_filters.Subscriber('face_detections', Recognitions)
+
+        # published topics
+        self.people_pub = rospy.Publisher('faces', FaceDetections, queue_size=1)
+        self.markers_pub = rospy.Publisher('~visualization', Marker, queue_size=1)
+
+        self._ts = message_filters.ApproximateTimeSynchronizer([recognitions_sub, depth_sub, depth_info_sub],
+                                                               queue_size=30, slop=0.1)
+        self._ts.registerCallback(self.callback)
+        rospy.loginfo('people_detector started')
+
+    def callback(self, recognitions, depth, depth_info):
+        cam_model = image_geometry.PinholeCameraModel()
+        cam_model.fromCameraInfo(depth_info)
+
+        detections_msg = FaceDetections(header=recognitions.header)
+        visualization_msg = Marker(
+            header=recognitions.header,
+            type=Marker.SPHERE_LIST,
+            id=0,
+            ns='positions',
+            action=Marker.ADD,
+            lifetime=rospy.Duration(1),
+            color=ColorRGBA(r=0.2, g=0.4, b=0.6, a=1.0),
+            scale=Vector3(0.2, 0.2, 0.2)
+        )
+        visualization_msg.pose.orientation.w = 1.0
+
+        for recognition in recognitions.recognitions:
+            detection = self.recognition_to_face_detection(recognition, depth, cam_model)
+            if detection:
+                detections_msg.detections.append(detection)
+                visualization_msg.points.append(detection.position)
+
+        if detections_msg.detections:
+            self.markers_pub.publish(visualization_msg)
+            self.people_pub.publish(detections_msg)
+
+    def recognition_to_face_detection(self, recognition, depth, cam_model):
+        cv_depth = self.bridge.imgmsg_to_cv2(depth, desired_encoding=depth.encoding)
+
+        roi = recognition.roi
+        x_min = roi.x_offset - self.padding
+        x_max = roi.x_offset + roi.width + self.padding
+        y_min = roi.y_offset - self.padding
+        y_max = roi.y_offset + roi.height + self.padding
+
+        if x_min < 0 or y_min < 0 or x_max > depth.width or y_max > depth.height:
+            rospy.logwarn("ROI outside of image")
+            return  # outside of the image
+
+        region = cv_depth[y_min:y_max, x_min:x_max]
+
+        u = (x_min + x_max) // 2
+        v = (y_min + y_max) // 2
+
+        # skip fully nan
+        if np.all(np.isnan(region)):
+            rospy.logwarn("ROI is NANs")
+            return
+
+        median = np.nanmedian(region)
+
+        # project to 3d
+        d = median
+        ray = np.array(cam_model.projectPixelTo3dRay((u, v)))
+        point3d = ray * d
+
+        return FaceDetection(position=Point(*point3d))
+
+
+if __name__ == '__main__':
+    rospy.init_node('recognition_to_3d_face_detections')
+    RecognitionTo3DFaceDetections()
+    rospy.spin()
